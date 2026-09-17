@@ -15,27 +15,34 @@ const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const MODEL = process.env.OPENAI_MODEL || "gpt-5.6-luna";
 
-const tmp = path.join(process.cwd(), "tmp_uploads");
-fs.mkdirSync(tmp, { recursive: true });
+const uploadDir = path.join(process.cwd(), "tmp_uploads");
+fs.mkdirSync(uploadDir, { recursive: true });
 
 const upload = multer({
-  dest: tmp,
-  limits: { files: 20, fileSize: 50 * 1024 * 1024 }
+  dest: uploadDir,
+  limits: {
+    files: 20,
+    fileSize: 50 * 1024 * 1024
+  }
 });
 
-const key = process.env.OPENAI_API_KEY;
-const client = key ? new OpenAI({ apiKey: key }) : null;
+const apiKey = process.env.OPENAI_API_KEY;
+
+const openai = apiKey
+  ? new OpenAI({ apiKey })
+  : null;
 
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
-app.get("/api/health", (_, res) =>
+// Health check
+app.get("/api/health", (req, res) => {
   res.json({
     ok: true,
-    aiConfigured: Boolean(key),
+    aiConfigured: Boolean(apiKey),
     model: MODEL
-  })
-);
+  });
+});
 
 const schema = {
   type: "object",
@@ -115,56 +122,70 @@ const schema = {
   required: ["questions", "repeatedGroups"]
 };
 
-const SYSTEM = `
-You are the RAJUVAS veterinary PYQ ingestion engine.
+const SYSTEM_PROMPT = `
+You are the RAJUVAS veterinary PYQ question-bank AI.
 
-Extract EVERY distinct exam question from the source.
+Extract every distinct exam question.
 
-Separate questions from answers even when answers are paragraphs,
-bullets, tables, or follow Answer/Ans/Solution labels.
+Separate questions from answers.
 
-Never invent a missing answer.
+Convert paragraph answers into concise numbered exam points.
 
-Convert paragraph answers into concise numbered exam points
-without changing scientific meaning.
+Never invent an answer that is not supported by the source.
 
-Detect year and Paper I/Paper II.
-
-Detect marks.
-
-Classify question type.
-
-Map questions to the closest veterinary chapter and topic.
+Detect:
+- Subject
+- Year
+- Paper I or Paper II
+- Question number
+- Marks
+- Question type
+- Chapter
+- Unit
+- Topic
 
 Group semantically repeated questions across years and papers.
 
-Preserve veterinary terminology and disease names.
-
-Confidence must be between 0 and 1.
-`;
-
-function buildPrompt(meta, text, file) {
-  return `${SYSTEM}
-
-Source file: ${file}
-
-Subject hint: ${meta.subjectHint || "Auto"}
-Paper hint: ${meta.paperHint || "Auto"}
-Year hint: ${meta.yearHint || "Auto"}
-Marks hint: ${meta.marksHint || "Auto"}
-Chapter hint: ${meta.chapterHint || "Auto"}
+Preserve veterinary terminology, disease names and scientific meaning.
 
 Return structured JSON only.
+`;
+
+function makePrompt(meta, text, filename) {
+  return `
+${SYSTEM_PROMPT}
+
+Source file:
+${filename}
+
+Subject hint:
+${meta.subjectHint || "Auto"}
+
+Paper hint:
+${meta.paperHint || "Auto"}
+
+Year hint:
+${meta.yearHint || "Auto"}
+
+Marks hint:
+${meta.marksHint || "Auto"}
+
+Chapter hint:
+${meta.chapterHint || "Auto"}
 
 SOURCE:
-${text}`;
+${text}
+`;
 }
 
 async function readFile(file) {
   const ext = path.extname(file.originalname).toLowerCase();
 
   if (ext === ".pdf") {
-    const data = await pdfParse(fs.readFileSync(file.path));
+    const data = await pdfParse(
+      fs.readFileSync(file.path)
+    );
+
     return data.text || "";
   }
 
@@ -172,6 +193,7 @@ async function readFile(file) {
     const data = await mammoth.extractRawText({
       path: file.path
     });
+
     return data.value || "";
   }
 
@@ -179,22 +201,30 @@ async function readFile(file) {
     const workbook = XLSX.readFile(file.path);
 
     return workbook.SheetNames
-      .map(name =>
-        `--- ${name} ---\n` +
-        XLSX.utils.sheet_to_csv(workbook.Sheets[name])
-      )
+      .map((sheetName) => {
+        return (
+          "--- " +
+          sheetName +
+          " ---\n" +
+          XLSX.utils.sheet_to_csv(
+            workbook.Sheets[sheetName]
+          )
+        );
+      })
       .join("\n");
   }
 
   return fs.readFileSync(file.path, "utf8");
 }
 
-async function analyzeText(text, meta, fileName) {
-  if (!client) {
-    throw new Error("OPENAI_API_KEY is not configured.");
+async function analyzeWithAI(text, meta, filename) {
+  if (!openai) {
+    throw new Error(
+      "OPENAI_API_KEY is not configured."
+    );
   }
 
-  const response = await client.responses.create({
+  const response = await openai.responses.create({
     model: MODEL,
 
     input: [
@@ -203,7 +233,7 @@ async function analyzeText(text, meta, fileName) {
         content: [
           {
             type: "input_text",
-            text: SYSTEM
+            text: SYSTEM_PROMPT
           }
         ]
       },
@@ -212,7 +242,11 @@ async function analyzeText(text, meta, fileName) {
         content: [
           {
             type: "input_text",
-            text: buildPrompt(meta, text, fileName)
+            text: makePrompt(
+              meta,
+              text,
+              filename
+            )
           }
         ]
       }
@@ -223,12 +257,14 @@ async function analyzeText(text, meta, fileName) {
         type: "json_schema",
         name: "rajuvas_pyq_result",
         strict: true,
-        schema
+        schema: schema
       }
     }
   });
 
-  return JSON.parse(response.output_text);
+  return JSON.parse(
+    response.output_text
+  );
 }
 
 app.post(
@@ -247,11 +283,12 @@ app.post(
     };
 
     if (
-      !files.length &&
+      files.length === 0 &&
       !String(req.body.text || "").trim()
     ) {
       return res.status(400).json({
-        error: "No files or pasted text received."
+        error:
+          "No files or pasted text received."
       });
     }
 
@@ -263,8 +300,109 @@ app.post(
 
         const text = await readFile(file);
 
-        const result = await analyzeText(
+        const result = await analyzeWithAI(
           text,
           meta,
           file.originalname
-       
+        );
+
+        for (const question of result.questions || []) {
+          questions.push({
+            ...question,
+            sourceFile:
+              question.sourceFile ||
+              file.originalname,
+
+            points:
+              Array.isArray(question.points)
+                ? question.points
+                : []
+          });
+        }
+
+        repeatedGroups.push(
+          ...(result.repeatedGroups || [])
+        );
+      }
+
+      // Pasted text
+      if (
+        String(req.body.text || "").trim()
+      ) {
+
+        const result = await analyzeWithAI(
+          String(req.body.text),
+          meta,
+          "Pasted Text"
+        );
+
+        for (const question of result.questions || []) {
+          questions.push({
+            ...question,
+            sourceFile:
+              question.sourceFile ||
+              "Pasted Text"
+          });
+        }
+
+        repeatedGroups.push(
+          ...(result.repeatedGroups || [])
+        );
+      }
+
+      // Remove duplicates
+      const seen = new Set();
+      const cleanQuestions = [];
+
+      for (const question of questions) {
+
+        const key = [
+          question.subject,
+          question.year,
+          question.paper,
+          question.question
+        ]
+          .join("|")
+          .toLowerCase()
+          .replace(/\s+/g, " ")
+          .trim();
+
+        if (!seen.has(key)) {
+          seen.add(key);
+          cleanQuestions.push(question);
+        }
+      }
+
+      res.json({
+        ok: true,
+        model: MODEL,
+        questions: cleanQuestions,
+        repeatedGroups
+      });
+
+    } catch (error) {
+
+      console.error(error);
+
+      res.status(500).json({
+        error:
+          error.message ||
+          "AI analysis failed."
+      });
+
+    } finally {
+
+      for (const file of files) {
+        try {
+          fs.unlinkSync(file.path);
+        } catch (_) {}
+      }
+    }
+  }
+);
+
+app.listen(PORT, () => {
+  console.log(
+    `RAJUVAS AI backend running on port ${PORT}`
+  );
+});
